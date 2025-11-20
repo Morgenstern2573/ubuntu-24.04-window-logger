@@ -23,7 +23,7 @@ import (
 
 // --- Configuration ---
 const (
-	pollInterval = 5 * time.Second
+	pollInterval = time.Second
 	dbFileName   = "activity.sqlite"
 	queueSize    = 1000
 )
@@ -153,6 +153,19 @@ func setupDatabase(ctx context.Context) (*bun.DB, error) {
 	sqldb, err := sql.Open(sqliteshim.ShimName, dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("opening sqlite file: %w", err)
+	}
+
+	// Enable WAL (Write-Ahead Logging) to improve concurrency and durability
+	// This persists in the database file, so running once is sufficient.
+	if _, err := sqldb.ExecContext(ctx, "PRAGMA journal_mode=WAL;"); err != nil {
+		return nil, fmt.Errorf("enabling WAL mode: %w", err)
+	}
+	// Recommended pragmas when using WAL. These are best-effort; failures are non-fatal.
+	if _, err := sqldb.ExecContext(ctx, "PRAGMA synchronous=NORMAL;"); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not set synchronous=NORMAL: %v\n", err)
+	}
+	if _, err := sqldb.ExecContext(ctx, "PRAGMA busy_timeout=5000;"); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not set busy_timeout: %v\n", err)
 	}
 
 	db := bun.NewDB(sqldb, sqlitedialect.New())
