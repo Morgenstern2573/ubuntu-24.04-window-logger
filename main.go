@@ -1,42 +1,48 @@
 package main
 
 import (
-	"bytes"
+	"context"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/godbus/dbus/v5"
+	"github.com/rs/xid"
+	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect/sqlitedialect"
+	"github.com/uptrace/bun/driver/sqliteshim"
 )
 
 // --- Configuration ---
 const (
-	pollInterval   = 5 * time.Second
-	webAppEndpoint = "http://localhost:9999/api/v1/log_activity" // Change this to your web app's URL
-	//webAppApiKey   = "YOUR_SECRET_API_KEY_HERE"                  // Change this to your secret key
-	maxBackoff   = 60 * time.Minute
-	localLogFile = "window-logs.json" // The local log file name
-	queueSize    = 1000               // Buffer size for network uploads (approx 1.5 hours of data)
+	pollInterval = 5 * time.Second
+	dbFileName   = "activity.sqlite"
+	queueSize    = 1000
 )
 
-// LogEntry is the complete data structure
+// LogEntry represents a row in the database
 type LogEntry struct {
-	Timestamp string  `json:"timestamp"`
-	Title     string  `json:"title,omitempty"`
-	AppName   string  `json:"appName,omitempty"`
-	PID       int     `json:"pid,omitempty"`
-	Cmdline   string  `json:"cmdline,omitempty"`
-	IdleTimeS float64 `json:"idle_time_s,omitempty"`
-	IsSwitch  bool    `json:"is_switch,omitempty"`
-	Error     string  `json:"error,omitempty"`
+	bun.BaseModel `bun:"table:activity_logs,alias:al"`
+
+	ID        string    `bun:",pk" json:"id"`
+	Timestamp time.Time `bun:"timestamp,notnull" json:"timestamp"`
+	Title     string    `bun:"title" json:"title,omitempty"`
+	AppName   string    `bun:"app_name" json:"appName,omitempty"`
+	PID       int       `bun:"pid" json:"pid,omitempty"`
+	Cmdline   string    `bun:"cmdline" json:"cmdline,omitempty"`
+	IdleTimeS float64   `bun:"idle_time_s" json:"idle_time_s,omitempty"`
+	IsSwitch  bool      `bun:"is_switch" json:"is_switch,omitempty"`
+	Error     string    `bun:"error" json:"error,omitempty"`
 }
 
-// WindowInfo is the JSON structure expected from our D-Bus extension
 type WindowInfo struct {
 	Title   string `json:"title"`
 	Pid     int    `json:"pid"`
@@ -45,11 +51,22 @@ type WindowInfo struct {
 }
 
 func main() {
-	// FIX 5: Implement -v (verbose) flag
-	verbose := flag.Bool("v", false, "Enable verbose stdout logging for each successful poll")
+	verbose := flag.Bool("v", false, "Enable verbose stdout logging")
 	flag.Parse()
 
-	// FIX 3: Connect to D-Bus once and reuse the connection
+	// 1. Create cancellable context for graceful shutdown
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	// 2. Setup Database
+	db, err := setupDatabase(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: Database setup failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
+	// 3. Setup D-Bus
 	conn, err := dbus.ConnectSessionBus()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: Could not connect to D-Bus: %v\n", err)
@@ -57,110 +74,108 @@ func main() {
 	}
 	defer conn.Close()
 
-	// --- NEW: Open local log file for appending ---
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "FATAL: Could not get home directory: %v\n", err)
-		os.Exit(1)
-	}
-	logPath := filepath.Join(homeDir, localLogFile)
-	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "FATAL: Could not open local log file %s: %v\n", logPath, err)
-		os.Exit(1)
-	}
-	defer logFile.Close()
+	// 4. Start Background DB Worker
+	var wg sync.WaitGroup
+	writeQueue := make(chan LogEntry, queueSize)
 
-	// --- NEW: Start the background network worker ---
-	sendQueue := make(chan []byte, queueSize)
-	go logSenderWorker(sendQueue)
+	wg.Add(1)
+	go dbWriterWorker(ctx, db, writeQueue, &wg)
+
+	fmt.Println("Starting focus logger agent... (Press Ctrl+C to stop)")
+	fmt.Printf("Polling every %s.\n", pollInterval)
+	fmt.Printf("Saving data to SQLite DB at: ~/%s\n", dbFileName)
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
 
 	var lastFocusedPID int
 
-	fmt.Println("Starting focus logger agent...")
-	fmt.Printf("Polling every %s.\n", pollInterval)
-	fmt.Printf("Appending logs to %s\n", logPath)
-	fmt.Printf("Pushing data to %s via background worker\n", webAppEndpoint)
-
-	if !*verbose {
-		fmt.Println("Run with -v to see verbose logging for each poll.")
-	}
-
+	// 5. Main Loop
+loop:
 	for {
-		// 1. Collect all data for this poll
-		entry := collectLogEntry(conn, &lastFocusedPID)
-
-		// 2. Marshal the entry to JSON ONCE
-		jsonData, jsonErr := json.Marshal(entry)
-		if jsonErr != nil {
-			fmt.Fprintf(os.Stderr, "Error marshaling log: %v\n", jsonErr)
-			time.Sleep(pollInterval)
-			continue
-		}
-
-		// 3. (Optional) Print to stdout if verbose
-		if *verbose {
-			fmt.Println(string(jsonData))
-		}
-
-		// 4. ALWAYS append to local log file immediately
-		fileLine := append(jsonData, '\n') // Add a newline
-		if _, writeErr := logFile.Write(fileLine); writeErr != nil {
-			fmt.Fprintf(os.Stderr, "Error writing to local log file %s: %v\n", logPath, writeErr)
-		}
-
-		// 5. Send to the background worker (Non-blocking)
 		select {
-		case sendQueue <- jsonData:
-			// Success: queued for upload
-		default:
-			// Failure: queue is full (network is likely down for a long time)
-			// We drop this upload packet to ensure the main loop (and disk logging) isn't blocked.
-			fmt.Fprintf(os.Stderr, "Network queue full! Dropping upload for this entry (Data saved to disk)\n")
-		}
+		case <-ctx.Done():
+			// Context cancelled (Ctrl+C)
+			fmt.Println("\nShutdown signal received. Stopping poller...")
+			break loop
+		case <-ticker.C:
+			// Poll
+			entry := collectLogEntry(conn, &lastFocusedPID)
 
-		// 6. Wait for next poll
-		time.Sleep(pollInterval)
-	}
-}
-
-// logSenderWorker handles the HTTP posts and backoff logic independently
-func logSenderWorker(queue <-chan []byte) {
-	httpClient := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-	currentBackoff := pollInterval
-
-	for jsonData := range queue {
-		// Retry loop for the CURRENT message
-		// We do not move to the next message until this one succeeds,
-		// ensuring strictly ordered uploads (unless the queue filled up and we dropped packets in main).
-		for {
-			err := sendActivityLog(httpClient, jsonData)
-			if err == nil {
-				// Success! Reset backoff and break the retry loop to get next message
-				currentBackoff = pollInterval
-				break
+			if *verbose {
+				fmt.Printf("[%s] %s (%s) [ID: %s]\n",
+					entry.Timestamp.Format(time.TimeOnly),
+					entry.AppName,
+					entry.Title,
+					entry.ID,
+				)
 			}
 
-			// Failure: Apply backoff
-			fmt.Fprintf(os.Stderr, "Send failed: %v. Backing off for %s\n", err, currentBackoff)
-			time.Sleep(currentBackoff)
-
-			// Increase backoff for next retry
-			currentBackoff *= 2
-			if currentBackoff > maxBackoff {
-				currentBackoff = maxBackoff
+			select {
+			case writeQueue <- entry:
+			default:
+				fmt.Fprintf(os.Stderr, "Warning: DB Write queue full. Dropping log entry.\n")
 			}
 		}
 	}
+
+	// 6. Cleanup
+	close(writeQueue) // Signal worker that no more data is coming
+	fmt.Println("Waiting for database worker to finish pending writes...")
+	wg.Wait() // Block until worker drains the queue
+	fmt.Println("Done.")
 }
 
-// collectLogEntry gathers all data (unchanged)
+// dbWriterWorker accepts context and WaitGroup for lifecycle management
+func dbWriterWorker(ctx context.Context, db *bun.DB, queue <-chan LogEntry, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for entry := range queue {
+		// Note: We use context.Background() here instead of the passed 'ctx'.
+		// If 'main' cancels 'ctx' (Ctrl+C), we still want to finish writing
+		// the logs currently in the buffer. If we used 'ctx', the DB call would
+		// fail immediately upon shutdown.
+		_, err := db.NewInsert().Model(&entry).Exec(context.Background())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing to DB: %v\n", err)
+		}
+	}
+}
+
+// setupDatabase initializes SQLite
+func setupDatabase(ctx context.Context) (*bun.DB, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("getting home dir: %w", err)
+	}
+
+	dbPath := filepath.Join(homeDir, dbFileName)
+	sqldb, err := sql.Open(sqliteshim.ShimName, dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("opening sqlite file: %w", err)
+	}
+
+	db := bun.NewDB(sqldb, sqlitedialect.New())
+
+	_, err = db.NewCreateTable().
+		Model((*LogEntry)(nil)).
+		IfNotExists().
+		Exec(ctx)
+
+	if err != nil {
+		return nil, fmt.Errorf("creating table: %w", err)
+	}
+
+	return db, nil
+}
+
+// collectLogEntry gathers all data
 func collectLogEntry(conn *dbus.Conn, lastPID *int) LogEntry {
-	entry := LogEntry{Timestamp: time.Now().Format(time.RFC3339)}
+	entry := LogEntry{
+		ID:        xid.New().String(),
+		Timestamp: time.Now(),
+	}
 
-	// Get focused window
 	title, pid, appName, err := getFocusedViaExtension(conn)
 	if err == nil {
 		entry.Title = title
@@ -182,7 +197,6 @@ func collectLogEntry(conn *dbus.Conn, lastPID *int) LogEntry {
 		*lastPID = 0
 	}
 
-	// Get user idle time
 	idleTime, idleErr := getIdleTime(conn)
 	if idleErr == nil {
 		entry.IdleTimeS = idleTime.Seconds()
@@ -194,29 +208,6 @@ func collectLogEntry(conn *dbus.Conn, lastPID *int) LogEntry {
 		}
 	}
 	return entry
-}
-
-// sendActivityLog performs the HTTP POST
-func sendActivityLog(client *http.Client, jsonData []byte) error {
-	req, err := http.NewRequest("POST", webAppEndpoint, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("http.NewRequest failed: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	//req.Header.Set("Authorization", "Bearer "+webAppApiKey)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("client.Do failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("server returned non-2xx status: %s", resp.Status)
-	}
-
-	return nil
 }
 
 // getFocusedViaExtension (unchanged)
