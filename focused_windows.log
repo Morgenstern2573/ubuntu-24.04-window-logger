@@ -1,0 +1,5 @@
+{"timestamp":"2025-10-27T18:50:03+01:00","method":"gdbus CLI fallback","error":"json parse failed: unexpected end of JSON input (payload: \"\") | couldn't parse gdbus output (no JSON found): \"(false, '')\\n\""}
+{"timestamp":"2025-10-27T18:50:08+01:00","method":"gdbus CLI fallback","error":"json parse failed: unexpected end of JSON input (payload: \"\") | couldn't parse gdbus output (no JSON found): \"(false, '')\\n\""}
+{"timestamp":"2025-10-27T18:50:13+01:00","method":"gdbus CLI fallback","error":"json parse failed: unexpected end of JSON input (payload: \"\") | couldn't parse gdbus output (no JSON found): \"(false, '')\\n\""}
+{"timestamp":"2025-10-27T18:50:18+01:00","method":"gdbus CLI fallback","error":"json parse failed: unexpected end of JSON input (payload: \"\") | couldn't parse gdbus output (no JSON found): \"(false, '')\\n\""}
+{"timestamp":"2025-10-27T18:50:23+01:00","method":"gdbus CLI fallback","error":"json parse failed: unexpected end of JSON input (payload: \"\") | couldn't parse gdbus output (no JSON found): \"(false, '')\\n\""}
