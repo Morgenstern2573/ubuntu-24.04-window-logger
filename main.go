@@ -26,6 +26,11 @@ const (
 	pollInterval = time.Second
 	dbFileName   = "activity.sqlite"
 	queueSize    = 1000
+
+	// Batching Configuration
+	// We hold logs in memory and write them in one transaction to save SSD wear.
+	batchSize    = 300             // Write to disk after collecting 300 entries...
+	batchTimeout = 5 * time.Minute // ...or every 5 minutes, whichever comes first.
 )
 
 // LogEntry represents a row in the database
@@ -79,11 +84,12 @@ func main() {
 	writeQueue := make(chan LogEntry, queueSize)
 
 	wg.Add(1)
-	go dbWriterWorker(ctx, db, writeQueue, &wg)
+	go dbWriterWorker(db, writeQueue, &wg)
 
 	fmt.Println("Starting focus logger agent... (Press Ctrl+C to stop)")
 	fmt.Printf("Polling every %s.\n", pollInterval)
 	fmt.Printf("Saving data to SQLite DB at: ~/%s\n", dbFileName)
+	fmt.Printf("Batching enabled: Writing every %d entries or %s.\n", batchSize, batchTimeout)
 
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
@@ -126,18 +132,57 @@ loop:
 	fmt.Println("Done.")
 }
 
-// dbWriterWorker accepts context and WaitGroup for lifecycle management
-func dbWriterWorker(ctx context.Context, db *bun.DB, queue <-chan LogEntry, wg *sync.WaitGroup) {
+// dbWriterWorker accepts context and WaitGroup for lifecycle management.
+// It buffers logs and writes them in batches to reduce disk I/O.
+func dbWriterWorker(db *bun.DB, queue <-chan LogEntry, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	for entry := range queue {
-		// Note: We use context.Background() here instead of the passed 'ctx'.
-		// If 'main' cancels 'ctx' (Ctrl+C), we still want to finish writing
-		// the logs currently in the buffer. If we used 'ctx', the DB call would
-		// fail immediately upon shutdown.
-		_, err := db.NewInsert().Model(&entry).Exec(context.Background())
+	// Buffer to hold logs in memory
+	buffer := make([]LogEntry, 0, batchSize)
+
+	// Ticker to force a write if the buffer doesn't fill up fast enough
+	ticker := time.NewTicker(batchTimeout)
+	defer ticker.Stop()
+
+	// Helper function to write the current buffer to DB
+	flush := func() {
+		if len(buffer) == 0 {
+			return
+		}
+
+		// Use context.Background() here. If 'main' cancels 'ctx' (Ctrl+C),
+		// we still want to finish writing the logs currently in the buffer
+		// rather than aborting mid-write.
+		_, err := db.NewInsert().Model(&buffer).Exec(context.Background())
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing to DB: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error writing batch to DB: %v\n", err)
+		}
+
+		// Reset buffer (keep capacity to avoid reallocation)
+		buffer = buffer[:0]
+	}
+
+	for {
+		select {
+		case entry, ok := <-queue:
+			if !ok {
+				// Channel closed (Main function finished)
+				flush() // Write whatever is left
+				return
+			}
+
+			buffer = append(buffer, entry)
+
+			// If buffer is full, write immediately
+			if len(buffer) >= batchSize {
+				flush()
+				// Reset ticker so we don't write again immediately after a full batch
+				ticker.Reset(batchTimeout)
+			}
+
+		case <-ticker.C:
+			// Timer expired, write whatever we have
+			flush()
 		}
 	}
 }
@@ -156,12 +201,12 @@ func setupDatabase(ctx context.Context) (*bun.DB, error) {
 	}
 
 	// Enable WAL (Write-Ahead Logging) to improve concurrency and durability
-	// This persists in the database file, so running once is sufficient.
+	// This persists in the database file, so running once is enough.
 	if _, err := sqldb.ExecContext(ctx, "PRAGMA journal_mode=WAL;"); err != nil {
 		return nil, fmt.Errorf("enabling WAL mode: %w", err)
 	}
 	// Recommended pragmas when using WAL. These are best-effort; failures are non-fatal.
-	if _, err := sqldb.ExecContext(ctx, "PRAGMA synchronous=NORMAL;"); err != nil {
+	if _, err := sqldb.ExecContext(ctx, "PRAGMA synchronous=OFF;"); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not set synchronous=NORMAL: %v\n", err)
 	}
 	if _, err := sqldb.ExecContext(ctx, "PRAGMA busy_timeout=5000;"); err != nil {
